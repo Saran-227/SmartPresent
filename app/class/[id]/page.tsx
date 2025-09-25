@@ -14,6 +14,8 @@ import AIAnalyticsDashboard from "@/components/ai-analytics-dashboard"
 import AddStudentDialog from "@/components/add-student-dialog"
 import SmartBot from "@/components/smartbot"
 import SmartScheduler from "@/components/smart-scheduler"
+import MidDayMealDashboard from "@/components/midday-meal"
+
 
 
 import {
@@ -48,8 +50,9 @@ export default function ClassDashboard() {
   const [searchTerm, setSearchTerm] = useState("")
   const [isLoading, setIsLoading] = useState(true)
   const [activeView, setActiveView] = useState<
-    "attendance" | "history" | "analytics" | "scheduler" | "smartbot"
+    "attendance" | "history" | "analytics" | "smartbot" | "scheduler" | "midday-meal"
   >("attendance")
+
 
 
 
@@ -306,8 +309,12 @@ export default function ClassDashboard() {
           <Button onClick={() => setActiveView("scheduler")} variant={activeView === "scheduler" ? "default" : "outline"}>
             Smart Scheduler
           </Button>
-
-
+          <Button
+            onClick={() => setActiveView("midday-meal")}
+            variant={activeView === "midday-meal" ? "default" : "outline"}
+          >
+            Mid-Day Meal
+          </Button>
         </div>
 
         {activeView === "attendance" && (
@@ -381,6 +388,8 @@ export default function ClassDashboard() {
         {activeView === "analytics" && <AIAnalyticsDashboard classId={classId} sessions={sessions} students={students} />}
         {activeView === "smartbot" && <SmartBot classId={classId} />}
         {activeView === "scheduler" && <SmartScheduler />}
+        {activeView === "midday-meal" && <MidDayMealDashboard />}
+
 
 
 
