@@ -15,6 +15,9 @@ import AddStudentDialog from "@/components/add-student-dialog"
 import SmartBot from "@/components/smartbot"
 import SmartScheduler from "@/components/smart-scheduler"
 import MidDayMealDashboard from "@/components/midday-meal"
+import ManualRFIDInput from "@/components/manual-rfid-input"
+import CSVUpload from "@/components/csv-upload"
+
 
 
 
@@ -79,9 +82,44 @@ export default function ClassDashboard() {
 
       setStudents(studentList)
 
-      const initialAttendance: Record<string, boolean> = {}
-      studentList.forEach((s: any) => (initialAttendance[s.id] = false))
-      setAttendance(initialAttendance)
+      const initializeAttendance = async () => {
+        const initialAttendance: Record<string, boolean> = {}
+
+        // First, set all students to absent
+        studentList.forEach((s: any) => (initialAttendance[s.id] = false))
+
+        // Then, check if there's a session today and mark present students
+        const today = new Date()
+        const todayDateString = today.toISOString().split('T')[0]
+
+        const { data: todaysSession } = await supabase
+          .from("attendance_sessions")
+          .select("id")
+          .eq("class_id", classId)
+          .gte("session_date", `${todayDateString}T00:00:00`)
+          .lt("session_date", `${todayDateString}T23:59:59`)
+          .single()
+
+        if (todaysSession) {
+          // Get today's attendance records
+          const { data: todaysAttendance } = await supabase
+            .from("attendance_records")
+            .select("student_id, status")
+            .eq("session_id", todaysSession.id)
+
+          if (todaysAttendance) {
+            todaysAttendance.forEach(record => {
+              if (record.status === "present") {
+                initialAttendance[record.student_id] = true
+              }
+            })
+          }
+        }
+
+        setAttendance(initialAttendance)
+      }
+
+      await initializeAttendance()
 
       setIsLoading(false)
     }
@@ -90,11 +128,19 @@ export default function ClassDashboard() {
   }, [classId])
 
   // ✅ Fetch sessions for history + analytics
+  // In your useEffect that fetches sessions - Update the query
   useEffect(() => {
     if (!classId) return
+
     supabase
       .from("attendance_sessions")
-      .select("*, attendance_records(*)")
+      .select(`
+      *,
+      attendance_records(
+        *,
+        student:students(name, uid)
+      )
+    `)
       .eq("class_id", classId)
       .order("session_date", { ascending: false })
       .then(({ data }) => setSessions(data || []))
@@ -112,63 +158,226 @@ export default function ClassDashboard() {
 
   // --- Save Session ---
   const handleSaveSession = async () => {
-    if (!currentSession || !classData) return
+    if (!currentSession || !classData) return;
 
     try {
+      const sessionId = crypto.randomUUID()
+
       const { data: insertedSession, error: sessionError } = await supabase
         .from("attendance_sessions")
-        .insert([
-          {
-            class_id: classData.id,
-            session_date:
-              currentSession.session_date instanceof Date
-                ? currentSession.session_date.toISOString()
-                : currentSession.session_date,
-            topic: currentSession.topic,
-            created_by: classData.teacher_id || null,
-          },
-        ])
+        .insert([{
+          id: sessionId,
+          class_id: classData.id,
+          session_date: currentSession.session_date instanceof Date
+            ? currentSession.session_date.toISOString()
+            : currentSession.session_date,
+          topic: currentSession.topic,
+          created_by: classData.teacher_id || null,
+        }])
         .select()
-        .single()
+        .single();
 
       if (sessionError || !insertedSession) {
-        console.error("session insert error", sessionError)
-        alert("Failed to save session.")
-        return
+        console.error("session insert error", sessionError);
+        alert("Failed to save session.");
+        return;
       }
 
-      const sessionId = insertedSession.id
+      // Create attendance records WITH STUDENT NAMES
+      const recordsToInsert = Object.entries(attendance).map(([studentId, present]) => {
+        const student = students.find(s => s.id === studentId)
+        return {
+          session_id: sessionId,
+          student_id: studentId,
+          student_name: student?.name || "Unknown",
+          status: present ? "present" : "absent",
+          method: "manual",
+        }
+      });
 
-      const recordsToInsert = Object.entries(attendance).map(([studentId, present]) => ({
-        session_id: sessionId,
-        student_id: studentId,
-        status: present ? "present" : "absent",
-        method: "manual",
-      }))
-
-      const { error: recError } = await supabase.from("attendance_records").insert(recordsToInsert)
+      const { error: recError } = await supabase
+        .from("attendance_records")
+        .insert(recordsToInsert);
 
       if (recError) {
-        console.error("attendance records insert error", recError)
-        alert("Attendance saved partially (records failed).")
+        console.error("attendance records insert error", recError);
+        alert("Attendance saved partially (records failed).");
+        return;
+      }
+
+      // Reset UI and refresh history
+      setCurrentSession(null);
+      const reset: Record<string, boolean> = {}
+      students.forEach((s) => (reset[s.id] = false));
+      setAttendance(reset);
+      alert("Session saved successfully!");
+
+      // Refresh sessions immediately
+      const { data: updatedSessions } = await supabase
+        .from("attendance_sessions")
+        .select(`
+        *,
+        attendance_records(
+          *,
+          student:students(name, uid)
+        )
+      `)
+        .eq("class_id", classId)
+        .order("session_date", { ascending: false });
+
+      setSessions(updatedSessions || []);
+
+    } catch (err) {
+      console.error("Unexpected error saving session:", err);
+      alert("An unexpected error occurred.");
+    }
+  };
+
+  // In page.tsx - Add automatic session creation
+  const ensureCurrentSession = async () => {
+    if (currentSession) return currentSession
+
+    // Create a new session for today if none exists
+    const today = new Date()
+    const sessionTopic = `RFID Session ${today.toLocaleDateString()}`
+
+    const { data: existingSession, error } = await supabase
+      .from("attendance_sessions")
+      .select("*")
+      .eq("class_id", classId)
+      .gte("session_date", new Date(today.setHours(0, 0, 0, 0)).toISOString())
+      .lt("session_date", new Date(today.setHours(23, 59, 59, 999)).toISOString())
+      .single()
+
+    if (existingSession) {
+      setCurrentSession({
+        session_date: new Date(existingSession.session_date),
+        topic: existingSession.topic || sessionTopic
+      })
+      return existingSession
+    }
+
+    // Create new session
+    const newSession = {
+      session_date: today,
+      topic: sessionTopic
+    }
+
+    setCurrentSession(newSession)
+    return newSession
+  }
+
+  // Update handleRFIDScan to ensure session exists
+  // In your page.tsx - REAL VERSION (reads from sheet)
+  const handleRFIDScan = async () => {
+    try {
+      if (!currentSession) {
+        alert("❌ Please start an attendance session first!")
         return
       }
 
-      // reset state
-      setCurrentSession(null)
-      const reset: Record<string, boolean> = {}
-      students.forEach((s) => (reset[s.id] = false))
-      setAttendance(reset)
+      console.log("🔄 Fetching real RFID data from Google Sheet...")
 
-      alert("Session saved successfully!")
+      const res = await fetch("/api/fetch-rfid")
+      const json = await res.json()
 
-      // 🔥 Trigger refresh in SessionHistory
-      if (typeof window !== "undefined") {
-        window.dispatchEvent(new Event("refresh-sessions"))
+      console.log("📊 API Response:", json)
+
+      if (!json.success) {
+        throw new Error(json.error || "Unknown API error")
       }
-    } catch (err) {
-      console.error("Unexpected error saving session:", err)
-      alert("An unexpected error occurred.")
+
+      if (!json.data || json.data.length === 0) {
+        alert("📭 No RFID data found in the sheet. Scan some cards first!")
+        return
+      }
+
+      console.log("📋 Raw sheet data:", json.data)
+
+      // Get recent scans (last 10 minutes)
+      const tenMinutesAgo = new Date(Date.now() - 10 * 60 * 1000)
+      const recentScans = json.data.filter((record: any) => {
+        try {
+          // Try different possible timestamp fields
+          const timestamp = record.Timestamp || record.INTime || record.Date
+          if (!timestamp) return false
+
+          const scanTime = new Date(timestamp)
+          return scanTime > tenMinutesAgo && scanTime <= new Date()
+        } catch (e) {
+          return false
+        }
+      })
+
+      console.log("⏰ Recent scans (last 10 min):", recentScans)
+
+      if (recentScans.length === 0) {
+        alert("⏰ No recent RFID scans found (last 10 minutes)")
+        return
+      }
+
+      // Extract UIDs from recent scans
+      const scannedUIDs = recentScans.map((scan: any) => {
+        // Try different possible UID field names
+        return scan.UID || scan.StudentID || scan.RFID || scan.CardID || scan.ID
+      }).filter((uid: any) => uid != null).map((uid: any) => uid.toString().trim())
+
+      console.log("🎫 Scanned UIDs:", scannedUIDs)
+
+      if (scannedUIDs.length === 0) {
+        alert("❌ No valid UIDs found in recent scans")
+        return
+      }
+
+      // Fetch students with UIDs from Supabase
+      const { data: studentsWithUID, error } = await supabase
+        .from("students")
+        .select("id, name, uid")
+        .not("uid", "is", null)
+
+      if (error) throw new Error(`Supabase error: ${error.message}`)
+
+      console.log("👥 Students with UIDs from Supabase:", studentsWithUID)
+
+      // Match UIDs
+      const matchedStudents = studentsWithUID?.filter(student =>
+        student.uid && scannedUIDs.includes(student.uid.toString().trim())
+      ) || []
+
+      console.log("✅ Matched students:", matchedStudents)
+
+      if (matchedStudents.length === 0) {
+        alert(`
+❌ No matching students found!
+
+Scanned UIDs: ${scannedUIDs.join(', ')}
+Students in DB: ${studentsWithUID?.map(s => s.uid).join(', ') || 'None'}
+
+Make sure:
+1. Students have UIDs in Supabase
+2. UIDs match exactly with RFID cards
+      `)
+        return
+      }
+
+      // Update attendance state
+      setAttendance(prev => {
+        const updated = { ...prev }
+        matchedStudents.forEach(student => {
+          updated[student.id] = true
+          console.log(`✅ Marking present: ${student.name} (UID: ${student.uid})`)
+        })
+        return updated
+      })
+
+      alert(`✅ RFID Scan Successful! 
+Marked ${matchedStudents.length} student(s) present:
+${matchedStudents.map(s => `• ${s.name} (${s.uid})`).join('\n')}
+    `)
+
+    } catch (err: any) {
+      console.error("❌ RFID Scan error:", err)
+      alert("❌ RFID Scan failed: " + (err.message || "Unknown error"))
     }
   }
 
@@ -176,43 +385,468 @@ export default function ClassDashboard() {
   // --- Add Student ---
   // --- Add Student ---
   // --- Add Student ---
-  const handleAddStudent = async (newStudent: { name: string }) => {
+  // In page.tsx - Update handleAddStudent function
+  // In your page.tsx - REPLACE the existing handleAddStudent function with this:
+
+  const handleAddStudent = async (newStudent: { name: string; uid?: string }) => {
     if (!classId) {
-      alert("Class ID missing. Please reload the page.");
-      return;
+      alert("Class ID missing. Please reload the page.")
+      return
     }
 
     try {
       // Generate random 5-digit roll number
-      const randomRoll = Math.floor(10000 + Math.random() * 90000).toString();
+      const randomRoll = Math.floor(10000 + Math.random() * 90000).toString()
 
-      // Insert student (only name now, no roll/email)
+      // Insert student with UID
       const { data: student, error: studentError } = await supabase
         .from("students")
-        .insert([{ name: newStudent.name }])
+        .insert([{
+          name: newStudent.name,
+          uid: newStudent.uid || null
+        }])
         .select()
-        .single();
+        .single()
 
-      if (studentError) throw studentError;
+      if (studentError) throw studentError
 
       // Link student to class with roll_number
       const { error: enrollmentError } = await supabase
         .from("enrollments")
-        .insert([{ class_id: classId, student_id: student.id, roll_number: randomRoll }]);
+        .insert([{
+          class_id: classId,
+          student_id: student.id,
+          roll_number: randomRoll
+        }])
 
-      if (enrollmentError) throw enrollmentError;
+      if (enrollmentError) throw enrollmentError
 
       // Update local state
-      setStudents((prev) => [
+      setStudents(prev => [
         ...prev,
-        { id: student.id, name: student.name, rollNumber: randomRoll }, // 👈 from enrollments
-      ]);
-      setAttendance((prev) => ({ ...prev, [student.id]: false }));
+        {
+          id: student.id,
+          name: student.name,
+          rollNumber: randomRoll,
+          uid: student.uid
+        }
+      ])
+
+      setAttendance(prev => ({ ...prev, [student.id]: false }))
+
     } catch (err: any) {
-      console.error("Error adding student:", err.message || err);
-      alert("Failed to add student.");
+      console.error("Error adding student:", err.message || err)
+      alert("Failed to add student.")
     }
-  };
+  }
+
+
+
+  // REPLACE your existing handleCSVData function with this ENHANCED version:
+
+  const handleCSVData = async (csvData: any[]) => {
+    if (!classId) {
+      alert("Class ID missing")
+      return
+    }
+
+    try {
+      let addedCount = 0
+      let updatedCount = 0
+      let markedPresentCount = 0
+      let markedAbsentCount = 0
+
+      // First, ensure we have a current session for today
+      const today = new Date()
+      const todayDateString = today.toISOString().split('T')[0]
+
+      let currentSessionId = null
+      let sessionTopic = `CSV Import Session - ${today.toLocaleDateString()}`
+
+      // Check if session exists for today
+      const { data: existingSession } = await supabase
+        .from("attendance_sessions")
+        .select("id, session_date, topic")
+        .eq("class_id", classId)
+        .gte("session_date", `${todayDateString}T00:00:00`)
+        .lt("session_date", `${todayDateString}T23:59:59`)
+        .single()
+
+      if (existingSession) {
+        currentSessionId = existingSession.id
+        sessionTopic = existingSession.topic || sessionTopic
+      } else {
+        // Create new session for today (using UUID for id)
+        const newSessionId = crypto.randomUUID()
+        const { data: newSession, error: sessionError } = await supabase
+          .from("attendance_sessions")
+          .insert([{
+            id: newSessionId,
+            class_id: classId,
+            session_date: today.toISOString(),
+            topic: sessionTopic,
+            created_by: classData?.teacher_id || null
+          }])
+          .select()
+          .single()
+
+        if (sessionError) throw sessionError
+        currentSessionId = newSession.id
+      }
+
+      // Process each student from CSV
+      for (const row of csvData) {
+        const uid = row.UID?.trim()
+        const firstName = row.FirstName?.trim()
+        const lastName = row.LastName?.trim()
+        const fullName = `${firstName} ${lastName}`.trim()
+        const inTime = row.INTime?.trim()
+        const outTime = row.OUTTime?.trim()
+
+        if (!uid || !fullName) continue
+
+        let studentId: string | null = null
+        let isPresent = false
+
+        // Check if student already exists with this UID
+        const { data: existingStudent } = await supabase
+          .from("students")
+          .select("id, name, uid")
+          .eq("uid", uid)
+          .single()
+
+        if (existingStudent) {
+          studentId = existingStudent.id
+          // Update existing student name if different
+          if (existingStudent.name !== fullName) {
+            await supabase
+              .from("students")
+              .update({ name: fullName })
+              .eq("id", existingStudent.id)
+          }
+          updatedCount++
+        } else {
+          // Add new student (UUID will be auto-generated)
+          const { data: newStudent, error: studentError } = await supabase
+            .from("students")
+            .insert([{
+              name: fullName,
+              uid: uid
+            }])
+            .select()
+            .single()
+
+          if (studentError) throw studentError
+
+          studentId = newStudent.id
+
+          // Generate roll number and enroll in class
+          const randomRoll = Math.floor(10000 + Math.random() * 90000).toString()
+          const { error: enrollmentError } = await supabase
+            .from("enrollments")
+            .insert([{
+              class_id: classId,
+              student_id: newStudent.id,
+              roll_number: randomRoll
+            }])
+
+          if (enrollmentError) throw enrollmentError
+
+          // Update local state
+          setStudents(prev => [
+            ...prev,
+            {
+              id: newStudent.id,
+              name: newStudent.name,
+              rollNumber: randomRoll,
+              uid: newStudent.uid
+            }
+          ])
+
+          addedCount++
+        }
+
+        // AUTOMATIC ATTENDANCE MARKING LOGIC
+        if (studentId && currentSessionId) {
+          const hasAttendance = inTime && inTime !== '' && inTime !== 'NULL' && inTime !== 'null'
+          isPresent = hasAttendance;
+
+          if (hasAttendance) {
+            // Student has IN time → Mark PRESENT
+            const { data: existingRecord } = await supabase
+              .from("attendance_records")
+              .select("id")
+              .eq("session_id", currentSessionId)
+              .eq("student_id", studentId)
+              .single()
+
+            if (!existingRecord) {
+              // Create attendance record WITH STUDENT NAME
+              const { error: attendanceError } = await supabase
+                .from("attendance_records")
+                .insert([{
+                  session_id: currentSessionId,
+                  student_id: studentId,
+                  student_name: fullName,
+                  status: "present",
+                  method: "csv_import"
+                }])
+
+              if (attendanceError) {
+                console.error("Attendance record error:", attendanceError)
+              } else {
+                markedPresentCount++
+              }
+            }
+          } else {
+            // Student has NO IN time → Mark ABSENT
+            const { data: existingRecord } = await supabase
+              .from("attendance_records")
+              .select("id")
+              .eq("session_id", currentSessionId)
+              .eq("student_id", studentId)
+              .single()
+
+            if (!existingRecord) {
+              const { error: attendanceError } = await supabase
+                .from("attendance_records")
+                .insert([{
+                  session_id: currentSessionId,
+                  student_id: studentId,
+                  student_name: fullName,
+                  status: "absent",
+                  method: "csv_import"
+                }])
+
+              if (!attendanceError) {
+                markedAbsentCount++
+              }
+            }
+          }
+
+          // Update local UI state immediately
+          setAttendance(prev => ({
+            ...prev,
+            [studentId!]: isPresent
+          }))
+        }
+      }
+
+      // Refresh sessions to show updated attendance
+      const { data: updatedSessions } = await supabase
+        .from("attendance_sessions")
+        .select(`
+        *,
+        attendance_records(
+          *,
+          student:students(name, uid)
+        )
+      `)
+        .eq("class_id", classId)
+        .order("session_date", { ascending: false })
+
+      setSessions(updatedSessions || [])
+
+      // Show comprehensive results
+      alert(`✅ CSV Import Completed!
+    
+📊 Student Management:
+• Added: ${addedCount} new students
+• Updated: ${updatedCount} existing students
+
+🎯 Attendance Marking:
+• Present: ${markedPresentCount} students (with IN time)
+• Absent: ${markedAbsentCount} students (no IN time)
+
+💡 Session: "${sessionTopic}"
+
+✅ Student names saved in attendance records!
+    `)
+
+    } catch (error: any) {
+      console.error("CSV import error:", error)
+      alert("❌ Error importing CSV: " + error.message)
+    }
+  }
+
+  // 🔽 PASTE SAMPLE DATA FUNCTION HERE 🔽
+  // REPLACE your handleAddSampleData function with this:
+
+  const handleAddSampleData = async () => {
+    if (!classId) {
+      alert("Class ID missing")
+      return
+    }
+
+    try {
+      const sampleData = [
+        {
+          UID: "89C39994",
+          FirstName: "Kanwar",
+          LastName: "Aaryaman",
+          Class: "CSE-AI",
+          INTime: "2025-09-25 23:40:56",  // Has IN time → PRESENT
+          OUTTime: "2025-09-25 23:43:23"
+        },
+        {
+          UID: "99AC9B94",
+          FirstName: "Sameer",
+          LastName: "Kumar",
+          Class: "CSE-AI",
+          INTime: "2025-09-25 23:43:55",  // Has IN time → PRESENT
+          OUTTime: "2025-09-25 23:44:05"
+        },
+        {
+          UID: "29D28754",
+          FirstName: "Saranjeet",
+          LastName: "Singh",
+          Class: "CSE-AI",
+          INTime: "",  // NO IN time → ABSENT
+          OUTTime: ""
+        }
+      ]
+
+      let addedCount = 0
+      let markedPresentCount = 0
+      let markedAbsentCount = 0
+
+      // Create or get today's session
+      const today = new Date()
+      const todayDateString = today.toISOString().split('T')[0]
+
+      const { data: existingSession } = await supabase
+        .from("attendance_sessions")
+        .select("id")
+        .eq("class_id", classId)
+        .gte("session_date", `${todayDateString}T00:00:00`)
+        .lt("session_date", `${todayDateString}T23:59:59`)
+        .single()
+
+      let sessionId = existingSession?.id
+
+      if (!sessionId) {
+        const { data: newSession, error: sessionError } = await supabase
+          .from("attendance_sessions")
+          .insert([{
+            class_id: classId,
+            session_date: today.toISOString(),
+            topic: `Sample Data Session - ${today.toLocaleDateString()}`,
+            created_by: classData?.teacher_id || null
+          }])
+          .select()
+          .single()
+
+        if (sessionError) throw sessionError
+        sessionId = newSession.id
+      }
+
+      // Process sample data
+      for (const studentData of sampleData) {
+        const uid = studentData.UID
+        const fullName = `${studentData.FirstName} ${studentData.LastName}`
+        const hasAttendance = studentData.INTime && studentData.INTime !== ''
+
+        // Check if student already exists
+        const { data: existingStudent } = await supabase
+          .from("students")
+          .select("id, uid")
+          .eq("uid", uid)
+          .single()
+
+        let studentId = existingStudent?.id
+
+        if (!existingStudent) {
+          const randomRoll = Math.floor(10000 + Math.random() * 90000).toString()
+
+          // Insert new student
+          const { data: newStudent, error: studentError } = await supabase
+            .from("students")
+            .insert([{ name: fullName, uid: uid }])
+            .select()
+            .single()
+
+          if (studentError) throw studentError
+
+          studentId = newStudent.id
+
+          // Enroll in class
+          const { error: enrollmentError } = await supabase
+            .from("enrollments")
+            .insert([{
+              class_id: classId,
+              student_id: newStudent.id,
+              roll_number: randomRoll
+            }])
+
+          if (enrollmentError) throw enrollmentError
+
+          // Update local state
+          setStudents(prev => [
+            ...prev,
+            {
+              id: newStudent.id,
+              name: newStudent.name,
+              rollNumber: randomRoll,
+              uid: newStudent.uid
+            }
+          ])
+
+          setAttendance(prev => ({ ...prev, [newStudent.id]: false }))
+          addedCount++
+        }
+
+        // Mark attendance based on IN time
+        if (studentId && sessionId) {
+          const status = hasAttendance ? "present" : "absent"
+
+          const { error: attendanceError } = await supabase
+            .from("attendance_records")
+            .insert([{
+              session_id: sessionId,
+              student_id: studentId,
+              status: status,
+              method: "sample_data"
+            }])
+
+          if (!attendanceError) {
+            if (hasAttendance) {
+              markedPresentCount++
+              // Update UI for current class students
+              if (students.some(s => s.id === studentId)) {
+                setAttendance(prev => ({ ...prev, [studentId!]: true }))
+              }
+            } else {
+              markedAbsentCount++
+            }
+          }
+        }
+      }
+
+      // Refresh sessions
+      const { data: updatedSessions } = await supabase
+        .from("attendance_sessions")
+        .select("*, attendance_records(*)")
+        .eq("class_id", classId)
+        .order("session_date", { ascending: false })
+
+      setSessions(updatedSessions || [])
+
+      alert(`✅ Sample Data Imported!
+
+👥 Students: ${addedCount} added
+📊 Attendance: ${markedPresentCount} present, ${markedAbsentCount} absent
+
+💡 Saranjeet was marked absent (no IN time in sample data)
+    `)
+
+    } catch (error: any) {
+      console.error("Sample data error:", error)
+      alert("❌ Error adding sample data: " + error.message)
+    }
+  }
+  // 🔼 END OF SAMPLE DATA FUNCTION 🔼
+
+
 
   // --- Delete Class ---
   const handleDeleteClass = async () => {
@@ -222,20 +856,27 @@ export default function ClassDashboard() {
   }
 
   // --- Export Data ---
+  // In your page.tsx - Update handleExportData function
   const handleExportData = async () => {
     const { data: sessions } = await supabase
       .from("attendance_sessions")
       .select("*, attendance_records(*)")
       .eq("class_id", classId)
 
-    const headers = ["Date", "Topic", "Student", "Status", "Method", "Session ID"]
-    const rows =
-      sessions?.flatMap((s: any) =>
-        s.attendance_records.map((r: any) => {
-          const student = students.find((st) => st.id === r.student_id)
-          return [s.session_date, s.topic, student?.name || "-", r.status, r.method, s.id]
-        })
-      ) || []
+    // Use student_name from attendance_records instead of joining with students
+    const headers = ["Date", "Topic", "Student Name", "Student ID", "Status", "Method", "Session ID"]
+
+    const rows = sessions?.flatMap((s: any) =>
+      s.attendance_records.map((r: any) => [
+        s.session_date,
+        s.topic,
+        r.student_name || "Unknown", // 🔥 USE STUDENT_NAME
+        r.student_id,
+        r.status,
+        r.method,
+        s.id
+      ])
+    ) || []
 
     const csv = [headers, ...rows].map((row) => row.join(",")).join("\n")
     const blob = new Blob([csv], { type: "text/csv" })
@@ -333,6 +974,30 @@ export default function ClassDashboard() {
                   <Button variant="outline" onClick={() => setCurrentSession(null)} className="ml-2">
                     Cancel
                   </Button>
+                  {/* Manual RFID Input */}
+                  <ManualRFIDInput
+                    onUIDSubmit={(uid) => {
+                      const student = students.find(s => s.uid === uid)
+                      if (student) {
+                        handleAttendanceChange(student.id, true)
+                        // Show success message
+                        const event = new CustomEvent('show-toast', {
+                          detail: { message: `✅ ${student.name} marked present!`, type: 'success' }
+                        })
+                        window.dispatchEvent(event)
+                      }
+                    }}
+                    students={students}
+                    disabled={!currentSession}
+                  />
+
+                  {/* CSV Upload Section */}
+                  <CSVUpload
+                    onDataProcessed={handleCSVData}
+                    onAddSampleData={handleAddSampleData}
+                    students={students}
+                  />
+
                 </CardContent>
               </Card>
             ) : (
@@ -384,7 +1049,14 @@ export default function ClassDashboard() {
           </>
         )}
 
-        {activeView === "history" && <SessionHistory classId={classId} className={classData.name} />}
+        {activeView === "history" && (
+          <SessionHistory
+            classId={classId}
+            className={classData.name}
+            sessions={sessions} // ✅ Pass sessions here
+          />
+        )}
+
         {activeView === "analytics" && <AIAnalyticsDashboard classId={classId} sessions={sessions} students={students} />}
         {activeView === "smartbot" && <SmartBot classId={classId} />}
         {activeView === "scheduler" && <SmartScheduler />}

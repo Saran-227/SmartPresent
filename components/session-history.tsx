@@ -7,46 +7,41 @@ import type { AttendanceSession } from "@/lib/types"
 interface Props {
   classId: string
   className?: string
+  sessions?: AttendanceSession[] // ✅ new prop
 }
 
-export default function SessionHistory({ classId, className }: Props) {
-  const [sessions, setSessions] = useState<AttendanceSession[]>([])
+export default function SessionHistory({ classId, className, sessions: propSessions }: Props) {
+  const [sessions, setSessions] = useState<AttendanceSession[]>(propSessions || [])
   const [loading, setLoading] = useState(true)
 
   const fetchSessions = async () => {
     setLoading(true)
     const { data, error } = await supabase
       .from("attendance_sessions")
-      .select(
-        `
-        id,
-        class_id,
-        session_date,
-        topic,
-        attendance_records (
-          id,
-          student_id,
-          status
-        )
-        `
-      )
+      .select("id, session_date, topic, attendance_records (id, student_id, status)")
+      .eq("class_id", classId)
       .order("session_date", { ascending: false })
 
     if (error) {
-      console.error("❌ Error fetching sessions:", error.message)
+      console.error("Error fetching sessions:", error.message)
       setSessions([])
     } else {
-      console.log("✅ Sessions fetched:", data) // 🔥 Debug log
-      setSessions(data as AttendanceSession[])
+      setSessions((data as AttendanceSession[]) || [])
     }
+
     setLoading(false)
   }
 
   useEffect(() => {
-    if (!classId) return
-    fetchSessions()
+    if (propSessions && propSessions.length > 0) {
+      setSessions(propSessions)
+      setLoading(false)
+    } else {
+      fetchSessions()
+    }
+  }, [classId, propSessions])
 
-    // listen for refresh event after saving session
+  useEffect(() => {
     const listener = () => fetchSessions()
     window.addEventListener("refresh-sessions", listener)
     return () => window.removeEventListener("refresh-sessions", listener)

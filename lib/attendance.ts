@@ -17,7 +17,7 @@ export async function getAttendance(classId: string) {
     .from('attendance')
     .select('*')
     .eq('class_id', classId);
-
+    
   if (error) console.error('Error fetching attendance:', error.message);
   return data;
 }

@@ -98,10 +98,8 @@ export default function HomePage() {
         {/* Welcome Section */}
         <div className="mb-8">
           <h2 className="text-3xl font-bold mb-2">
-            Welcome back,{" "}
-            {LocalStorage.getTeacher()
-              ? LocalStorage.getTeacher().name.split(" ")[0]
-              : "Teacher"}
+            Welcome back, {LocalStorage.getTeacher()?.name ? LocalStorage.getTeacher()!.name.split(" ")[0] : "Teacher"}
+
           </h2>
 
           <p className="text-muted-foreground text-lg">
